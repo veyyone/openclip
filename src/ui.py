@@ -1,17 +1,22 @@
-#!/usr/bin/env python3
 """
-OpenClip UI
-Dark-themed popup (Super+V) showing clipboard history.
-Clicking an item pastes it; Escape closes the window.
-
-Toolkit: Tkinter + Pillow
+OpenClip UI Module
+Dark-themed, Windows-style (Super+V) clipboard popup.
+Features:
+- Instant toggle via resident IPC or standalone mode
+- Single-click auto-paste directly into previous active window
+- Universal smooth scrolling (mouse wheel + touchpad)
+- Real-time live updates when new content is copied
+- Strict single-instance management (no duplicate/stale windows)
+- Always-on-top frameless overlay at bottom-right of screen
 """
 
 import io
 import logging
 import os
+import socket
 import subprocess
 import sys
+import threading
 import time
 import tkinter as tk
 from pathlib import Path
@@ -19,355 +24,529 @@ from tkinter import font as tkfont
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from security import (
-    DATA_DIR,
-    SecurityManager,
-    ensure_data_dir,
-    load_history,
-)
+from security import DATA_DIR, SecurityManager, ensure_data_dir, load_history
+import x11_helper
 
 try:
-    from PIL import Image, ImageTk, ImageDraw, ImageFont
+    from PIL import Image, ImageTk
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Theme
+# Constants & Theme (Windows 11 inspired dark fluent theme)
 # ---------------------------------------------------------------------------
+SOCKET_PATH = f"/tmp/openclip_{os.getuid()}.sock"
+POPUP_WIDTH = 380
+POPUP_HEIGHT = 500
+MAX_DISPLAY = 50
+THUMB_MAX_W = 200
+THUMB_MAX_H = 110
+
 THEME = {
-    "bg": "#1e1e2e",
-    "bg2": "#2a2a3e",
-    "bg_hover": "#3a3a5e",
-    "fg": "#cdd6f4",
-    "fg_dim": "#7f849c",
-    "accent": "#89b4fa",
-    "border": "#45475a",
-    "scrollbar": "#45475a",
-    "font_main": ("Segoe UI", 11) if sys.platform == "win32" else ("Ubuntu", 11),
-    "font_small": ("Segoe UI", 9) if sys.platform == "win32" else ("Ubuntu", 9),
-    "radius": 8,
+    "bg": "#181825",          # Deep dark base
+    "header_bg": "#11111b",   # Dark header bar
+    "card_bg": "#252538",     # Card background
+    "card_hover": "#363654",  # Card hover highlight
+    "fg": "#cdd6f4",          # Primary text
+    "fg_dim": "#9399b2",      # Secondary / timestamp text
+    "accent": "#89b4fa",      # Accent blue
+    "border": "#313244",      # Subtle borders
+    "badge_bg": "#1e1e2e",    # Tag / badge background
+    "font_family": "Ubuntu" if sys.platform != "win32" else "Segoe UI",
 }
 
-THUMB_W, THUMB_H = 180, 100
-MAX_DISPLAY = 50
-_WAYLAND = bool(os.environ.get("WAYLAND_DISPLAY"))
-
 
 # ---------------------------------------------------------------------------
-# Paste helpers
+# UI Popup Class
 # ---------------------------------------------------------------------------
 
-def _copy_to_clipboard(text: str | None = None, image_bytes: bytes | None = None):
-    """Write text or image back to the system clipboard."""
-    try:
-        if text is not None:
-            if _WAYLAND:
-                proc = subprocess.Popen(
-                    ["wl-copy"],
-                    stdin=subprocess.PIPE,
-                )
-            else:
-                proc = subprocess.Popen(
-                    ["xclip", "-selection", "clipboard"],
-                    stdin=subprocess.PIPE,
-                )
-            proc.communicate(input=text.encode("utf-8"))
-
-        elif image_bytes is not None:
-            if _WAYLAND:
-                proc = subprocess.Popen(
-                    ["wl-copy", "--type", "image/png"],
-                    stdin=subprocess.PIPE,
-                )
-            else:
-                proc = subprocess.Popen(
-                    ["xclip", "-selection", "clipboard", "-t", "image/png"],
-                    stdin=subprocess.PIPE,
-                )
-            proc.communicate(input=image_bytes)
-    except FileNotFoundError as exc:
-        log.error("Clipboard tool not found: %s", exc)
-
-
-def _trigger_paste():
-    """Simulate Ctrl+V in the previously focused application."""
-    time.sleep(0.12)   # let the window close / focus return
-    try:
-        if _WAYLAND:
-            subprocess.run(["wtype", "-M", "ctrl", "-k", "v", "-m", "ctrl"], timeout=3)
-        else:
-            subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+v"], timeout=3)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-        log.warning("Auto-paste failed: %s", exc)
-
-
-# ---------------------------------------------------------------------------
-# Main popup window
-# ---------------------------------------------------------------------------
-
-class OpenClipUI:
-    def __init__(self):
-        ensure_data_dir()
-        self.sec = SecurityManager()
-        self.history = load_history(self.sec)
+class OpenClipPopup:
+    def __init__(self, sec: SecurityManager, history_getter=None, paste_callback=None):
+        self.sec = sec
+        self.get_history = history_getter or (lambda: load_history(self.sec))
+        self.on_paste_selected = paste_callback
 
         self.root = tk.Tk()
         self.root.title("OpenClip")
-        self.root.overrideredirect(True)       # frameless
-        self.root.attributes("-topmost", True) # always on top
+        self.root.overrideredirect(True)
+        self.root.attributes("-topmost", True)
         self.root.configure(bg=THEME["bg"])
 
-        self._image_refs: list = []  # keep Tk image refs alive
+        # State
+        self.is_visible = False
+        self.target_window_id: int | None = None
+        self._image_cache: dict[str, ImageTk.PhotoImage] = {}
+        self._card_widgets: list[tk.Widget] = []
 
-        self._build_ui()
-        self._position_window()
-        self.root.bind("<Escape>", lambda _e: self.root.destroy())
-        self.root.bind("<FocusOut>", self._on_focus_out)
-        self.root.focus_force()
+        self._build_scaffold()
+        self._bind_global_events()
+
+        # Start hidden by default (ready for instant reveal)
+        self.root.withdraw()
 
     # ------------------------------------------------------------------
-    # Window positioning
+    # UI Scaffold & Construction
     # ------------------------------------------------------------------
 
-    def _position_window(self):
-        """Place the popup near the bottom-right of the primary screen."""
+    def _build_scaffold(self):
+        # Header
+        self.header = tk.Frame(self.root, bg=THEME["header_bg"], height=42, padx=14)
+        self.header.pack(fill=tk.X, side=tk.TOP)
+        self.header.pack_propagate(False)
+
+        title_lbl = tk.Label(
+            self.header,
+            text="📋  Clipboard",
+            bg=THEME["header_bg"],
+            fg=THEME["accent"],
+            font=(THEME["font_family"], 11, "bold"),
+        )
+        title_lbl.pack(side=tk.LEFT, pady=10)
+
+        self.count_badge = tk.Label(
+            self.header,
+            text="0 items",
+            bg=THEME["badge_bg"],
+            fg=THEME["fg_dim"],
+            font=(THEME["font_family"], 8),
+            padx=6,
+            pady=2,
+        )
+        self.count_badge.pack(side=tk.LEFT, padx=8, pady=10)
+
+        close_btn = tk.Label(
+            self.header,
+            text="✕",
+            bg=THEME["header_bg"],
+            fg=THEME["fg_dim"],
+            font=(THEME["font_family"], 11),
+            cursor="hand2",
+            padx=8,
+        )
+        close_btn.pack(side=tk.RIGHT, pady=8)
+        close_btn.bind("<Button-1>", lambda _e: self.hide())
+        close_btn.bind("<Enter>", lambda _e: close_btn.configure(fg=THEME["fg"], bg=THEME["card_hover"]))
+        close_btn.bind("<Leave>", lambda _e: close_btn.configure(fg=THEME["fg_dim"], bg=THEME["header_bg"]))
+
+        # Scrollable Canvas
+        self.container = tk.Frame(self.root, bg=THEME["bg"])
+        self.container.pack(fill=tk.BOTH, expand=True)
+
+        self.canvas = tk.Canvas(
+            self.container,
+            bg=THEME["bg"],
+            highlightthickness=0,
+            bd=0,
+        )
+        self.scrollbar = tk.Scrollbar(
+            self.container,
+            orient=tk.VERTICAL,
+            command=self.canvas.yview,
+            width=10,
+        )
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+
+        self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.inner_frame = tk.Frame(self.canvas, bg=THEME["bg"])
+        self.canvas_win = self.canvas.create_window((0, 0), window=self.inner_frame, anchor="nw")
+
+        self.inner_frame.bind(
+            "<Configure>",
+            lambda _e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        )
+        self.canvas.bind(
+            "<Configure>",
+            lambda e: self.canvas.itemconfig(self.canvas_win, width=e.width)
+        )
+
+        # Universal Mousewheel / Trackpad Scrolling
+        self._bind_mouse_scroll(self.root)
+        self._bind_mouse_scroll(self.canvas)
+        self._bind_mouse_scroll(self.inner_frame)
+
+    def _bind_mouse_scroll(self, widget):
+        """Recursively bind smooth scrolling to widget and all future children."""
+        def _scroll_up(event=None):
+            self.canvas.yview_scroll(-3, "units")
+
+        def _scroll_down(event=None):
+            self.canvas.yview_scroll(3, "units")
+
+        def _mouse_wheel(event):
+            if event.num == 4 or (hasattr(event, "delta") and event.delta > 0):
+                self.canvas.yview_scroll(-3, "units")
+            elif event.num == 5 or (hasattr(event, "delta") and event.delta < 0):
+                self.canvas.yview_scroll(3, "units")
+
+        # Linux X11 uses Button-4 (up) and Button-5 (down)
+        widget.bind("<Button-4>", _scroll_up, add="+")
+        widget.bind("<Button-5>", _scroll_down, add="+")
+        widget.bind("<MouseWheel>", _mouse_wheel, add="+")
+
+    def _bind_global_events(self):
+        # Escape closes popup
+        self.root.bind("<Escape>", lambda _e: self.hide())
+
+        # Auto-hide on loss of focus
+        def _on_focus_out(event):
+            # If focus moved outside our top-level window, hide
+            self.root.after(100, self._check_focus)
+
+        self.root.bind("<FocusOut>", _on_focus_out)
+
+    def _check_focus(self):
+        if not self.is_visible:
+            return
+        try:
+            focused = self.root.focus_get()
+            if focused is None:
+                self.hide()
+        except Exception:
+            self.hide()
+
+    # ------------------------------------------------------------------
+    # Visibility & Positioning
+    # ------------------------------------------------------------------
+
+    def show(self, target_window_id: int | None = None):
+        """Display the popup at bottom-right and refresh cards."""
+        self.target_window_id = target_window_id
+        self.is_visible = True
+
+        self.refresh_cards()
+
         self.root.update_idletasks()
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
-        ww = self.root.winfo_reqwidth()
-        wh = self.root.winfo_reqheight()
-        x = sw - ww - 24
-        y = sh - wh - 60
-        self.root.geometry(f"{ww}x{wh}+{x}+{y}")
+        x = sw - POPUP_WIDTH - 20
+        y = sh - POPUP_HEIGHT - 60
+
+        self.root.geometry(f"{POPUP_WIDTH}x{POPUP_HEIGHT}+{x}+{y}")
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+        self.canvas.yview_moveto(0)
+
+    def hide(self):
+        """Instantly hide the popup."""
+        if not self.is_visible:
+            return
+        self.is_visible = False
+        try:
+            self.root.withdraw()
+        except Exception:
+            pass
+
+    def toggle(self, target_window_id: int | None = None):
+        """Toggle between visible and hidden."""
+        if self.is_visible:
+            self.hide()
+        else:
+            self.show(target_window_id=target_window_id)
 
     # ------------------------------------------------------------------
-    # UI construction
+    # Card Rendering & Live Updating
     # ------------------------------------------------------------------
 
-    def _build_ui(self):
-        # Header bar
-        header = tk.Frame(self.root, bg=THEME["bg2"], pady=8)
-        header.pack(fill=tk.X)
-        tk.Label(
-            header,
-            text="📋  Clipboard History",
-            bg=THEME["bg2"],
-            fg=THEME["accent"],
-            font=(*THEME["font_main"], "bold"),
-        ).pack(side=tk.LEFT, padx=14)
-        tk.Button(
-            header,
-            text="✕",
-            bg=THEME["bg2"],
-            fg=THEME["fg_dim"],
-            activebackground=THEME["bg_hover"],
-            activeforeground=THEME["fg"],
-            relief=tk.FLAT,
-            bd=0,
-            padx=10,
-            command=self.root.destroy,
-        ).pack(side=tk.RIGHT, padx=4)
+    def refresh_cards(self):
+        """Re-render all history items."""
+        # Clear existing cards
+        for widget in self.inner_frame.winfo_children():
+            widget.destroy()
+        self._card_widgets.clear()
 
-        # Scrollable canvas
-        container = tk.Frame(self.root, bg=THEME["bg"])
-        container.pack(fill=tk.BOTH, expand=True)
+        history = self.get_history()
+        count = len(history)
+        self.count_badge.configure(text=f"{count} {'item' if count == 1 else 'items'}")
 
-        canvas = tk.Canvas(
-            container,
-            bg=THEME["bg"],
-            highlightthickness=0,
-            width=420,
-            height=min(60 * len(self.history) + 10, 480),
-        )
-        scrollbar = tk.Scrollbar(container, orient=tk.VERTICAL, command=canvas.yview)
-        canvas.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        if not history:
+            empty_frame = tk.Frame(self.inner_frame, bg=THEME["bg"], pady=60)
+            empty_frame.pack(fill=tk.BOTH, expand=True)
+            self._bind_mouse_scroll(empty_frame)
 
-        inner = tk.Frame(canvas, bg=THEME["bg"])
-        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
-
-        def _on_configure(event):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-            canvas.itemconfig(window_id, width=canvas.winfo_width())
-
-        inner.bind("<Configure>", _on_configure)
-        canvas.bind("<MouseWheel>", lambda e: canvas.yview_scroll(-1 * (e.delta // 120), "units"))
-        canvas.bind("<Button-4>", lambda _e: canvas.yview_scroll(-1, "units"))
-        canvas.bind("<Button-5>", lambda _e: canvas.yview_scroll(1, "units"))
-
-        if not self.history:
-            tk.Label(
-                inner,
-                text="No clipboard history yet.\nCopy something to get started!",
+            lbl = tk.Label(
+                empty_frame,
+                text="📋\n\nYour clipboard history is empty.\nCopy some text or screenshots!",
                 bg=THEME["bg"],
                 fg=THEME["fg_dim"],
-                font=THEME["font_main"],
-                pady=40,
-            ).pack()
+                font=(THEME["font_family"], 10),
+                justify=tk.CENTER,
+            )
+            lbl.pack()
+            self._bind_mouse_scroll(lbl)
             return
 
-        for idx, entry in enumerate(self.history[:MAX_DISPLAY]):
-            self._build_entry_row(inner, idx, entry)
+        for idx, entry in enumerate(history[:MAX_DISPLAY]):
+            self._create_card(entry, idx)
 
-    def _build_entry_row(self, parent: tk.Frame, idx: int, entry: dict):
-        """Build a single history row."""
-        row = tk.Frame(parent, bg=THEME["bg"], pady=2, padx=6)
-        row.pack(fill=tk.X)
+    def prepend_card(self, entry: dict):
+        """Live update: prepend a newly copied entry to the top in real time."""
+        if not self.is_visible:
+            return
 
-        # Separator (except first)
-        if idx > 0:
-            sep = tk.Frame(row, bg=THEME["border"], height=1)
-            sep.pack(fill=tk.X, pady=(0, 2))
+        # If currently showing empty message, refresh all
+        if not self._card_widgets:
+            self.refresh_cards()
+            return
 
-        card = tk.Frame(row, bg=THEME["bg2"], padx=10, pady=8)
-        card.pack(fill=tk.X)
+        card = self._render_card_widget(entry)
+        card.pack(fill=tk.X, padx=10, pady=(6, 2), before=self._card_widgets[0] if self._card_widgets else None)
+        self._card_widgets.insert(0, card)
 
-        if entry.get("type") == "image":
-            self._build_image_card(card, entry)
-        else:
-            self._build_text_card(card, entry)
+        # Update count
+        count = len(self._card_widgets)
+        self.count_badge.configure(text=f"{count} {'item' if count == 1 else 'items'}")
+        self.canvas.yview_moveto(0)
 
-        # Hover effects
-        def _on_enter(e, f=card):
-            f.configure(bg=THEME["bg_hover"])
-            for child in f.winfo_children():
-                try:
-                    child.configure(bg=THEME["bg_hover"])
-                except tk.TclError:
-                    pass
+    def _create_card(self, entry: dict, idx: int):
+        card = self._render_card_widget(entry)
+        card.pack(fill=tk.X, padx=10, pady=(6, 2))
+        self._card_widgets.append(card)
 
-        def _on_leave(e, f=card):
-            f.configure(bg=THEME["bg2"])
-            for child in f.winfo_children():
-                try:
-                    child.configure(bg=THEME["bg2"])
-                except tk.TclError:
-                    pass
+    def _render_card_widget(self, entry: dict) -> tk.Frame:
+        entry_type = entry.get("type", "text")
 
-        def _on_click(e, entry=entry):
-            self._select_entry(entry)
-
-        for widget in [card] + list(card.winfo_children()):
-            widget.bind("<Enter>", _on_enter)
-            widget.bind("<Leave>", _on_leave)
-            widget.bind("<Button-1>", _on_click)
-
-    def _build_text_card(self, card: tk.Frame, entry: dict):
-        preview = entry.get("preview", "")
-        # Truncate long previews
-        display = preview[:300].replace("\n", " ↵ ") if preview else "(empty)"
-        label = tk.Label(
-            card,
-            text=display,
-            bg=THEME["bg2"],
-            fg=THEME["fg"],
-            font=THEME["font_main"],
-            anchor="w",
-            justify=tk.LEFT,
-            wraplength=380,
+        card = tk.Frame(
+            self.inner_frame,
+            bg=THEME["card_bg"],
+            bd=1,
+            relief=tk.FLAT,
+            padx=12,
+            pady=10,
+            cursor="hand2",
         )
-        label.pack(fill=tk.X, anchor="w")
-        # Timestamp
-        ts = entry.get("timestamp", 0)
-        time_str = time.strftime("%H:%M", time.localtime(ts)) if ts else ""
-        tk.Label(
-            card,
-            text=time_str,
-            bg=THEME["bg2"],
-            fg=THEME["fg_dim"],
-            font=THEME["font_small"],
-            anchor="e",
-        ).pack(fill=tk.X, anchor="e")
 
-    def _build_image_card(self, card: tk.Frame, entry: dict):
-        enc_path = Path(entry.get("enc_path", ""))
+        # Content Frame
+        content_frame = tk.Frame(card, bg=THEME["card_bg"])
+        content_frame.pack(fill=tk.BOTH, expand=True)
+
+        if entry_type == "image":
+            self._render_image_content(content_frame, entry)
+        else:
+            self._render_text_content(content_frame, entry)
+
+        # Footer (Badge & Timestamp)
+        footer = tk.Frame(card, bg=THEME["card_bg"], pady=4)
+        footer.pack(fill=tk.X, side=tk.BOTTOM)
+
+        badge_text = "🖼 Image" if entry_type == "image" else "📄 Text"
+        type_badge = tk.Label(
+            footer,
+            text=badge_text,
+            bg=THEME["badge_bg"],
+            fg=THEME["fg_dim"],
+            font=(THEME["font_family"], 8),
+            padx=6,
+            pady=1,
+        )
+        type_badge.pack(side=tk.LEFT)
+
         ts = entry.get("timestamp", 0)
-        time_str = time.strftime("%H:%M", time.localtime(ts)) if ts else ""
+        time_str = self._format_timestamp(ts)
+        time_lbl = tk.Label(
+            footer,
+            text=time_str,
+            bg=THEME["card_bg"],
+            fg=THEME["fg_dim"],
+            font=(THEME["font_family"], 8),
+        )
+        time_lbl.pack(side=tk.RIGHT)
+
+        # Interactions & Bindings
+        all_card_widgets = [card, content_frame, footer, type_badge, time_lbl] + list(content_frame.winfo_children())
+
+        def _on_hover(_e):
+            card.configure(bg=THEME["card_hover"])
+            content_frame.configure(bg=THEME["card_hover"])
+            footer.configure(bg=THEME["card_hover"])
+            time_lbl.configure(bg=THEME["card_hover"])
+
+        def _on_leave(_e):
+            card.configure(bg=THEME["card_bg"])
+            content_frame.configure(bg=THEME["card_bg"])
+            footer.configure(bg=THEME["card_bg"])
+            time_lbl.configure(bg=THEME["card_bg"])
+
+        def _on_click(_e, ent=entry):
+            self._handle_item_click(ent)
+
+        for w in all_card_widgets:
+            w.bind("<Enter>", _on_hover)
+            w.bind("<Leave>", _on_leave)
+            w.bind("<Button-1>", _on_click)
+            self._bind_mouse_scroll(w)
+
+        return card
+
+    def _render_text_content(self, parent: tk.Frame, entry: dict):
+        text = entry.get("preview", "")
+        # Show first ~4 lines neatly
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        display_text = "\n".join(lines[:4])
+        if len(lines) > 4 or len(text) > 200:
+            display_text += "..."
+
+        lbl = tk.Label(
+            parent,
+            text=display_text,
+            bg=THEME["card_bg"],
+            fg=THEME["fg"],
+            font=(THEME["font_family"], 10),
+            justify=tk.LEFT,
+            anchor="w",
+            wraplength=POPUP_WIDTH - 60,
+        )
+        lbl.pack(fill=tk.X, anchor="w", pady=(0, 4))
+
+    def _render_image_content(self, parent: tk.Frame, entry: dict):
+        enc_path = Path(entry.get("enc_path", ""))
+        rendered = False
 
         if PIL_AVAILABLE and enc_path.exists():
             try:
-                raw = self.sec.load_image(enc_path)
-                img = Image.open(io.BytesIO(raw))
-                img.thumbnail((THUMB_W, THUMB_H), Image.LANCZOS)
-                tk_img = ImageTk.PhotoImage(img)
-                self._image_refs.append(tk_img)
-                img_label = tk.Label(card, image=tk_img, bg=THEME["bg2"])
-                img_label.pack(anchor="w")
+                raw_bytes = self.sec.load_image(enc_path)
+                cache_key = str(enc_path)
+                if cache_key not in self._image_cache:
+                    pil_img = Image.open(io.BytesIO(raw_bytes))
+                    pil_img.thumbnail((THUMB_MAX_W, THUMB_MAX_H), Image.LANCZOS)
+                    self._image_cache[cache_key] = ImageTk.PhotoImage(pil_img)
+
+                img_label = tk.Label(
+                    parent,
+                    image=self._image_cache[cache_key],
+                    bg=THEME["card_bg"],
+                )
+                img_label.pack(anchor="w", pady=(0, 4))
+                rendered = True
             except Exception as exc:
-                log.warning("Could not render thumbnail: %s", exc)
-                tk.Label(
-                    card,
-                    text="🖼  [Image]",
-                    bg=THEME["bg2"],
-                    fg=THEME["fg"],
-                    font=THEME["font_main"],
-                ).pack(anchor="w")
-        else:
-            tk.Label(
-                card,
-                text="🖼  [Image]",
-                bg=THEME["bg2"],
-                fg=THEME["fg"],
-                font=THEME["font_main"],
-            ).pack(anchor="w")
+                log.warning("Thumbnail error: %s", exc)
 
-        tk.Label(
-            card,
-            text=time_str,
-            bg=THEME["bg2"],
-            fg=THEME["fg_dim"],
-            font=THEME["font_small"],
-            anchor="e",
-        ).pack(fill=tk.X, anchor="e")
+        if not rendered:
+            lbl = tk.Label(
+                parent,
+                text="[Encrypted Screenshot]",
+                bg=THEME["card_bg"],
+                fg=THEME["accent"],
+                font=(THEME["font_family"], 10, "italic"),
+            )
+            lbl.pack(anchor="w", pady=(0, 4))
+
+    def _format_timestamp(self, ts: float) -> str:
+        if not ts:
+            return ""
+        delta = time.time() - ts
+        if delta < 60:
+            return "Just now"
+        elif delta < 3600:
+            mins = int(delta // 60)
+            return f"{mins}m ago"
+        elif delta < 86400:
+            hours = int(delta // 3600)
+            return f"{hours}h ago"
+        return time.strftime("%b %d, %H:%M", time.localtime(ts))
 
     # ------------------------------------------------------------------
-    # Entry selection / paste
+    # Selection & Auto-Paste Action
     # ------------------------------------------------------------------
 
-    def _select_entry(self, entry: dict):
-        """Copy the selected entry to clipboard, close popup, and trigger paste."""
-        if entry.get("type") == "text":
-            text = entry.get("preview", "")
-            _copy_to_clipboard(text=text)
-        elif entry.get("type") == "image":
+    def _handle_item_click(self, entry: dict):
+        """When an item is clicked, copy it, hide popup, and auto-paste into previous window."""
+        log.info("Item selected for auto-paste (type=%s)", entry.get("type"))
+        target_win = self.target_window_id
+
+        # 1. Put onto system clipboard
+        if entry.get("type") == "image":
             enc_path = Path(entry.get("enc_path", ""))
             if enc_path.exists():
                 try:
                     raw = self.sec.load_image(enc_path)
-                    _copy_to_clipboard(image_bytes=raw)
+                    x11_helper.copy_to_system_clipboard(image_bytes=raw)
                 except Exception as exc:
-                    log.error("Could not load image for paste: %s", exc)
+                    log.error("Could not load image: %s", exc)
                     return
+        else:
+            text = entry.get("preview", "")
+            x11_helper.copy_to_system_clipboard(text=text)
 
-        self.root.destroy()
-        _trigger_paste()
+        # 2. Hide OpenClip popup immediately
+        self.hide()
 
-    # ------------------------------------------------------------------
+        # 3. Notify callback if registered
+        if self.on_paste_selected:
+            self.on_paste_selected(entry, target_win)
+            return
 
-    def _on_focus_out(self, event):
-        """Close popup when it loses focus (click elsewhere)."""
-        # Small delay to let click events register first
-        self.root.after(150, self.root.destroy)
+        # Default paste execution
+        def _execute_paste():
+            if target_win:
+                x11_helper.activate_window(target_win)
+            # Give window manager 60ms to switch focus
+            time.sleep(0.06)
+            x11_helper.simulate_paste()
+
+        threading.Thread(target=_execute_paste, daemon=True).start()
 
     def run(self):
         self.root.mainloop()
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# IPC Client (invoked by Super+V)
 # ---------------------------------------------------------------------------
 
+def send_ipc_command(cmd: str) -> bool:
+    """Send command to resident daemon socket. Returns True on success."""
+    if not os.path.exists(SOCKET_PATH):
+        return False
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(0.5)
+        sock.connect(SOCKET_PATH)
+        sock.sendall(cmd.encode("utf-8") + b"\n")
+        sock.close()
+        return True
+    except Exception as exc:
+        log.debug("IPC failed: %s", exc)
+        return False
+
+
 def main():
-    app = OpenClipUI()
-    app.run()
+    # 1. Get currently active window ID before anything else
+    active_win = x11_helper.get_active_window()
+    cmd = f"toggle:{active_win if active_win else 0}"
+
+    # 2. Try sending toggle to running daemon
+    if send_ipc_command(cmd):
+        # Daemon handled it in <10ms!
+        sys.exit(0)
+
+    # 3. If daemon not responding, start daemon in background
+    log.info("OpenClip daemon not running. Starting daemon...")
+    daemon_script = Path(__file__).parent / "daemon.py"
+    subprocess.Popen(
+        [sys.executable, str(daemon_script)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+    # Wait up to 1.5s for socket to become ready
+    for _ in range(30):
+        time.sleep(0.05)
+        if send_ipc_command(cmd):
+            sys.exit(0)
+
+    # 4. Fallback: run UI directly
+    ensure_data_dir()
+    sec = SecurityManager()
+    popup = OpenClipPopup(sec)
+    popup.show(target_window_id=active_win)
+    popup.run()
 
 
 if __name__ == "__main__":

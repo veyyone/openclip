@@ -38,9 +38,10 @@ install -d "${BUILD_DIR}/DEBIAN"
 # 2. Install application source
 # ---------------------------------------------------------------------------
 echo "==> Installing application files..."
-install -m 644 src/daemon.py    "${BUILD_DIR}/usr/lib/openclip/daemon.py"
-install -m 644 src/ui.py        "${BUILD_DIR}/usr/lib/openclip/ui.py"
-install -m 644 src/security.py  "${BUILD_DIR}/usr/lib/openclip/security.py"
+install -m 644 src/daemon.py      "${BUILD_DIR}/usr/lib/openclip/daemon.py"
+install -m 644 src/ui.py          "${BUILD_DIR}/usr/lib/openclip/ui.py"
+install -m 644 src/security.py    "${BUILD_DIR}/usr/lib/openclip/security.py"
+install -m 644 src/x11_helper.py  "${BUILD_DIR}/usr/lib/openclip/x11_helper.py"
 
 # ---------------------------------------------------------------------------
 # 3. Launcher scripts (wrapping the Python modules)
