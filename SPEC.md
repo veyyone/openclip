@@ -28,3 +28,4 @@ Build a secure, open-source, Windows-style (`Win + V`) clipboard manager for Ubu
 1. Scaffold the full repository (`src/daemon.py`, `src/ui.py`, `src/security.py`, `build_deb.sh`, `README.md`, `LICENSE`, `SECURITY.md`).
 2. Wire `daemon.py` and `ui.py` to use `security.py` for encrypted text/image storage and password-manager filtering.
 3. Verify the `.deb` build succeeds cleanly with `./build_deb.sh`.
+
